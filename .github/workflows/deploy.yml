@@ -1,0 +1,59 @@
+name: Deploy ML Service
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: ghcr.io/parkhyunchang/bio-agent-ml
+  NAS_DEPLOY_PATH: /volume1/docker/bio-agent-back
+  CONTAINER_NAME: bio_agent_ml
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:latest
+
+      - name: Deploy to NAS via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.NAS_HOST }}
+          username: ${{ secrets.NAS_USER }}
+          password: ${{ secrets.NAS_SSH_PASSWORD }}
+          script_stop: true
+          script: |
+            cd ${{ env.NAS_DEPLOY_PATH }}
+
+            # ghcr.io 로그인
+            echo "${{ secrets.GHCR_PAT }}" | /usr/local/bin/docker login ghcr.io -u parkhyunchang --password-stdin
+
+            # 모델 저장 디렉토리 보장
+            mkdir -p /volume1/docker/bio-agent-ml/model
+
+            # 최신 이미지 Pull 및 재시작 (model 볼륨 유지됨)
+            /usr/local/bin/docker-compose pull bio-agent-ml
+            /usr/local/bin/docker-compose up -d --no-deps bio-agent-ml
+
+            # 미사용 이미지 정리
+            /usr/local/bin/docker image prune -f
