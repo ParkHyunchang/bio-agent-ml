@@ -26,6 +26,14 @@ python main.py
 # → http://localhost:3212/docs (Swagger UI)
 ```
 
+```bash
+netstat -ano | findstr :3212
+taskkill /F /PID [확인된PID]
+or
+ Get-Process -Id [확인된PID]
+Stop-Process -Id [확인된PID] -Force
+```
+
 ## Docker 실행
 
 ```bash

@@ -67,13 +67,16 @@ class ModelManager:
         y_pred = pipeline.predict(X)
 
         self.pipeline = pipeline
+        # NaN이 포함된 경우(소규모 LOO CV에서 발생) 0으로 대체
+        cv_r2_clean = np.nan_to_num(cv_r2, nan=0.0)
+
         self.meta = {
             "sample_count": n,
             "model_type": type(base_model).__name__,
             "train_r2": round(float(r2_score(y, y_pred)), 4),
             "train_rmse": round(float(np.sqrt(mean_squared_error(y, y_pred))), 4),
-            "cv_r2_mean": round(float(np.mean(cv_r2)), 4),
-            "cv_r2_std": round(float(np.std(cv_r2)), 4),
+            "cv_r2_mean": round(float(np.mean(cv_r2_clean)), 4),
+            "cv_r2_std": round(float(np.std(cv_r2_clean)), 4),
             "trained_at": datetime.now(timezone.utc).isoformat(),
         }
 
