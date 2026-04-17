@@ -13,6 +13,10 @@ PCR 젤 전기영동 이미지에서 밴드 특징을 추출하는 모듈.
 import cv2
 import numpy as np
 
+from logger import get_logger
+
+log = get_logger("image_processor")
+
 
 def process_gel_image(image_bytes: bytes) -> dict:
     """
@@ -63,6 +67,7 @@ def process_gel_image(image_bytes: bytes) -> dict:
 
     # ── 5. 밴드 검출 실패 폴백 ───────────────────────────────────────
     if not contours:
+        log.info("밴드 검출 실패 - 전체 이미지 통계 사용 (size=%dx%d)", img.shape[1], img.shape[0])
         return {
             "band_intensity": float(np.mean(blurred)),
             "band_area": float(blurred.size),
@@ -97,5 +102,9 @@ def process_gel_image(image_bytes: bytes) -> dict:
     # 경고: 단일 밴드만 검출된 경우 래더 정규화 불가
     if len(contours) == 1:
         result["warning"] = "밴드 1개만 검출됨. 래더 포함 여부를 확인하세요."
+        log.info("밴드 1개 검출 - 래더 확인 필요 (intensity=%.1f, area=%.0f)", band_intensity, band_area)
+    else:
+        log.info("밴드 검출 완료 (lanes=%d, intensity=%.1f, area=%.0f, rel=%.3f)",
+                 len(contours), band_intensity, band_area, relative_intensity)
 
     return result

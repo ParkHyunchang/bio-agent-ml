@@ -17,6 +17,10 @@ from typing import List
 
 import joblib
 import numpy as np
+
+from logger import get_logger
+
+log = get_logger("model_manager")
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -85,6 +89,10 @@ class ModelManager:
         with open(META_PATH, "w", encoding="utf-8") as f:
             json.dump(self.meta, f, ensure_ascii=False, indent=2)
 
+        log.info("모델 학습 완료 - %s | samples=%d, R²=%.4f, RMSE=%.4f, CV_R²=%.4f±%.4f",
+                 self.meta["model_type"], n,
+                 self.meta["train_r2"], self.meta["train_rmse"],
+                 self.meta["cv_r2_mean"], self.meta["cv_r2_std"])
         return self.meta
 
     def predict(self, features: dict) -> dict:
@@ -100,6 +108,7 @@ class ModelManager:
         X = self._to_matrix([features])
         predicted_ct = float(self.pipeline.predict(X)[0])
 
+        log.info("Ct값 예측 완료 - predicted_ct=%.2f (model=%s)", predicted_ct, self.meta.get("model_type"))
         return {
             "predicted_ct": round(predicted_ct, 2),
             "model_r2": self.meta.get("cv_r2_mean", 0.0),
@@ -121,8 +130,10 @@ class ModelManager:
                 self.pipeline = joblib.load(MODEL_PATH)
                 with open(META_PATH, encoding="utf-8") as f:
                     self.meta = json.load(f)
+                log.info("저장된 모델 로드 완료 - %s (samples=%d, R²=%.4f)",
+                         self.meta.get("model_type"), self.meta.get("sample_count", 0), self.meta.get("train_r2", 0))
             except Exception as e:
-                print(f"[ModelManager] 모델 로드 실패 (무시됨): {e}")
+                log.warning("모델 로드 실패 (무시됨): %s", e)
 
     @staticmethod
     def _select_model(n: int):

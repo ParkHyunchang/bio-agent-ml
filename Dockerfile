@@ -18,6 +18,8 @@ COPY . .
 # 모델 저장 디렉토리 생성
 RUN mkdir -p model
 
+ENV APP_ENV=production
+
 EXPOSE 3212
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3212"]

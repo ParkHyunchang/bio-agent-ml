@@ -9,18 +9,33 @@ PCR 젤 이미지 분석 ML 마이크로서비스.
   GET  /health         헬스체크
 """
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 
 from image_processor import process_gel_image
+from logger import get_logger, setup_logging
 from model_manager import ModelManager
+
+setup_logging()
+log = get_logger("main")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("PCR Gel ML Service 시작 (port=3212)")
+    yield
+
 
 app = FastAPI(
     title="PCR Gel ML Service",
     description="PCR 젤 이미지에서 qPCR Ct값을 예측하는 회귀 모델 서비스",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -29,6 +44,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    log.info("%s %s → %d (%.1fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
+
 
 # 앱 시작 시 저장된 모델 자동 로드
 model_manager = ModelManager()
