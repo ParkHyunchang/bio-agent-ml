@@ -1,9 +1,9 @@
 {
   "sample_count": 6,
   "model_type": "LinearRegression",
-  "train_r2": 0.9859,
-  "train_rmse": 0.4382,
+  "train_r2": 0.9979,
+  "train_rmse": 0.1505,
   "cv_r2_mean": 0.0,
   "cv_r2_std": 0.0,
-  "trained_at": "2026-04-20T02:13:31.197409+00:00"
+  "trained_at": "2026-04-20T09:28:57.492870+00:00"
 }
