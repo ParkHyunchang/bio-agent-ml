@@ -1,7 +1,7 @@
 """
-환경에 따른 로깅 설정.
-  APP_ENV=local (기본값) → 터미널 출력
-  APP_ENV=production     → logs/app.log 파일 출력 (일별 롤링, 30일 보관)
+로깅 설정.
+  LOG_TO_FILE=true → logs/app.log 파일 출력 (일별 롤링, 30일 보관)
+  그 외 (기본값)   → stdout 출력 (Docker logs 캡처 가능)
 """
 
 import logging
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # .env 파일이 있으면 자동 로드 (없어도 무시)
 
-APP_ENV = os.getenv("APP_ENV", "local")
+_LOG_TO_FILE = os.getenv("LOG_TO_FILE", "").lower() == "true"
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)-5s] %(name)s - %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -42,7 +42,7 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def _build_handler() -> logging.Handler:
-    if APP_ENV != "local":
+    if _LOG_TO_FILE:
         os.makedirs("logs", exist_ok=True)
         handler = TimedRotatingFileHandler(
             filename="logs/app.log",
