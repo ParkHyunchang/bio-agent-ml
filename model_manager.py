@@ -31,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 MODEL_PATH = "model/ct_predictor.pkl"
 META_PATH = "model/ct_predictor_meta.json"
 
-FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width"]
+FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height"]
 
 
 class ModelManager:
@@ -82,6 +82,7 @@ class ModelManager:
             "cv_r2_mean": round(float(np.mean(cv_r2_clean)), 4),
             "cv_r2_std": round(float(np.std(cv_r2_clean)), 4),
             "trained_at": datetime.now(timezone.utc).isoformat(),
+            "feature_count": len(FEATURE_KEYS),
         }
 
         os.makedirs("model", exist_ok=True)
@@ -106,7 +107,16 @@ class ModelManager:
             raise ValueError("학습된 모델이 없습니다. /train 을 먼저 실행하세요.")
 
         X = self._to_matrix([features])
+        # 저장된 모델의 피처 수와 다를 경우 슬라이싱 (하위 호환)
+        trained_feature_count = self.meta.get("feature_count", 4)
+        if X.shape[1] != trained_feature_count:
+            X = X[:, :trained_feature_count]
         predicted_ct = float(self.pipeline.predict(X)[0])
+
+        CT_MIN, CT_MAX = 5.0, 50.0
+        if predicted_ct < CT_MIN or predicted_ct > CT_MAX:
+            log.warning("Ct값 범위 이탈 (%.2f) → 미검출 처리", predicted_ct)
+            raise ValueError(f"예측값({predicted_ct:.2f})이 유효 범위({CT_MIN}–{CT_MAX})를 벗어났습니다.")
 
         log.info("Ct값 예측 완료 - predicted_ct=%.2f (model=%s)", predicted_ct, self.meta.get("model_type"))
         return {
@@ -120,6 +130,15 @@ class ModelManager:
         if self.pipeline is None:
             return {"trained": False, "message": "학습된 모델 없음"}
         return {"trained": True, **self.meta}
+
+    def reset(self):
+        """모델과 메타 파일을 삭제하고 초기화합니다."""
+        self.pipeline = None
+        self.meta = {}
+        for path in [MODEL_PATH, META_PATH]:
+            if os.path.exists(path):
+                os.remove(path)
+        log.info("모델 초기화 완료")
 
     # ── 내부 헬퍼 ──────────────────────────────────────────────────
 

@@ -12,12 +12,12 @@ PCR 젤 이미지 분석 ML 마이크로서비스.
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 
-from image_processor import process_gel_image
+from image_processor import extract_gel_lanes, process_gel_image
 from logger import get_logger, setup_logging
 from model_manager import ModelManager
 
@@ -138,10 +138,67 @@ async def predict_ct(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"예측 오류: {e}")
 
 
+@app.post("/extract-gel", summary="젤 이미지 전체 레인 특징 추출")
+async def extract_gel_endpoint(
+    file: UploadFile = File(...),
+    n_lanes: int = Form(10),
+):
+    """
+    PCR 젤 이미지의 각 레인에서 밴드 특징을 추출합니다.
+    레인 순서: M, 10^8, 10^7, 10^6, 10^5, 10^4, 10^3, 10^2, 10^1, NTC
+    """
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="빈 파일입니다.")
+        return extract_gel_lanes(image_bytes, n_lanes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"이미지 처리 오류: {e}")
+
+
+@app.post("/predict-gel", summary="젤 이미지 전체 레인 Ct값 예측")
+async def predict_gel_endpoint(
+    file: UploadFile = File(...),
+    n_lanes: int = Form(10),
+):
+    """
+    PCR 젤 이미지의 각 레인에서 Ct값을 예측합니다.
+    모델이 학습되지 않은 경우 predicted_ct는 null로 반환됩니다.
+    """
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="빈 파일입니다.")
+
+        lanes_data = extract_gel_lanes(image_bytes, n_lanes)
+        for lane in lanes_data["lanes"]:
+            try:
+                pred = model_manager.predict(lane)
+            except ValueError:
+                pred = {"predicted_ct": None, "model_r2": None, "model_rmse": None}
+            lane.update(pred)
+
+        lanes_data["model_trained"] = model_manager.pipeline is not None
+        return lanes_data
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"예측 오류: {e}")
+
+
 @app.get("/model/status", summary="모델 현황 조회")
 def model_status():
     """현재 학습된 모델의 메타 정보를 반환합니다 (R², RMSE, 샘플 수 등)."""
     return model_manager.get_status()
+
+
+@app.delete("/model", summary="학습 모델 초기화")
+def reset_model():
+    """모델 파일을 삭제하고 미학습 상태로 초기화합니다."""
+    model_manager.reset()
+    return {"status": "reset"}
 
 
 if __name__ == "__main__":
