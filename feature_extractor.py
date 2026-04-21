@@ -50,7 +50,9 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
     band_row = int(np.argmax(row_profile))
     peak_intensity = float(row_profile[band_row])
 
-    is_negative = peak_intensity < 8.0
+    # 전체 이미지 최대값 대비 1% 미만이면 노이즈로 판단 (고정 임계값 대신 상대 기준 사용)
+    noise_threshold = max(1.0, global_max * 0.01)
+    is_negative = peak_intensity < noise_threshold
     is_saturated = peak_intensity > 240.0
 
     if is_negative:

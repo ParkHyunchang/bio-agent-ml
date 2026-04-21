@@ -31,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 MODEL_PATH = "model/ct_predictor.pkl"
 META_PATH = "model/ct_predictor_meta.json"
 
-FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height"]
+FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height", "log10_concentration"]
 
 
 class ModelManager:
