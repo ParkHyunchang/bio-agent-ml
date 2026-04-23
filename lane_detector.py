@@ -33,6 +33,7 @@ def detect_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
         raise ValueError("이미지를 읽을 수 없습니다. 지원 형식: JPEG, PNG, BMP, TIFF")
 
     h, w = img.shape
+    log.info("레인 검출 시작: 이미지=%dx%d, 목표 레인=%d개", w, h, n_lanes)
 
     # 방향 정규화: 밝은 배경 → 반전
     if float(np.mean(img)) > 128:
@@ -50,6 +51,7 @@ def detect_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
     lane_centers = find_lane_centers(col_profile, n_lanes)
 
     half_w = max(w // (n_lanes * 2), 20)
+    log.info("레인 검출 완료: %d개 중심 검출, half_w=%dpx, global_max=%.1f", len(lane_centers), half_w, global_max)
 
     return {
         "image": blurred,

@@ -29,6 +29,7 @@ def extract_gel_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
             n_lanes_detected   int         실제 검출된 레인 수
             warning            str|None    경고 메시지
     """
+    log.info("멀티레인 추출 시작: size=%dbytes, 목표=%d레인", len(image_bytes), n_lanes)
     ctx = detect_lanes(image_bytes, n_lanes)
     img = ctx["image"]
     lane_centers = ctx["lane_centers"]
@@ -47,7 +48,9 @@ def extract_gel_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
         lane_img = img[roi_top:roi_bot, col_start:col_end]
         lanes.append(extract_lane_features(lane_img, label, idx, global_max))
 
-    log.info("멀티레인 추출 완료: %d개 레인", len(lanes))
+    saturated = sum(1 for l in lanes if l.get("is_saturated"))
+    negative  = sum(1 for l in lanes if l.get("is_negative"))
+    log.info("멀티레인 추출 완료: %d개 레인 (포화=%d, 미검출=%d)", len(lanes), saturated, negative)
     return {
         "lanes": lanes,
         "n_lanes_detected": len(lanes),

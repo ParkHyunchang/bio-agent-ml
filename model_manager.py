@@ -59,14 +59,22 @@ class ModelManager:
         y = np.array(ct_values, dtype=float)
         n = len(y)
 
+        log.info("학습 시작 - 샘플: %d개, 특징: %s", n, FEATURE_KEYS)
+        log.info("Ct 범위 - min=%.2f, max=%.2f, mean=%.2f", float(y.min()), float(y.max()), float(y.mean()))
+
         base_model = self._select_model(n)
+        log.info("모델 선택: %s (샘플 수 %d 기준)", type(base_model).__name__, n)
         pipeline = Pipeline([("scaler", StandardScaler()), ("model", base_model)])
 
         # 교차 검증
         cv = LeaveOneOut() if n <= 10 else min(5, n)
+        cv_label = "LeaveOneOut" if n <= 10 else f"{cv}-fold"
+        log.info("교차 검증 시작: %s", cv_label)
         cv_r2 = cross_val_score(pipeline, X, y, cv=cv, scoring="r2")
+        log.info("교차 검증 완료: R² scores=%s", np.round(cv_r2, 4).tolist())
 
         # 전체 데이터로 최종 학습
+        log.info("전체 데이터로 최종 모델 학습 중...")
         pipeline.fit(X, y)
         y_pred = pipeline.predict(X)
 

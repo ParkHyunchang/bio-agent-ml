@@ -128,13 +128,18 @@ async def predict_ct(file: UploadFile = File(...)):
         image_bytes = await file.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
+        log.info("단일 Ct 예측 시작: file=%s, size=%dbytes", file.filename, len(image_bytes))
         features = process_gel_image(image_bytes)
         prediction = model_manager.predict(features)
-        prediction["features"] = features  # 참고용 특징값
+        prediction["features"] = features
+        log.info("단일 Ct 예측 완료: file=%s, predicted_ct=%.2f, model_r2=%.4f",
+                 file.filename, prediction.get("predicted_ct", 0), prediction.get("model_r2", 0))
         return prediction
     except ValueError as e:
+        log.warning("Ct 예측 범위 이탈: file=%s, reason=%s", file.filename, e)
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
+        log.error("Ct 예측 오류: file=%s, error=%s", file.filename, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"예측 오류: {e}")
 
 
@@ -151,10 +156,16 @@ async def extract_gel_endpoint(
         image_bytes = await file.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
-        return extract_gel_lanes(image_bytes, n_lanes)
+        log.info("레인 추출 시작: file=%s, n_lanes=%d", file.filename, n_lanes)
+        result = extract_gel_lanes(image_bytes, n_lanes)
+        log.info("레인 추출 완료: file=%s, 검출=%d/%d개",
+                 file.filename, result["n_lanes_detected"], n_lanes)
+        return result
     except ValueError as e:
+        log.warning("레인 추출 오류: file=%s, reason=%s", file.filename, e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        log.error("레인 추출 오류: file=%s, error=%s", file.filename, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"이미지 처리 오류: {e}")
 
 
@@ -172,19 +183,30 @@ async def predict_gel_endpoint(
         if not image_bytes:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
 
+        log.info("멀티레인 예측 시작: file=%s, n_lanes=%d", file.filename, n_lanes)
         lanes_data = extract_gel_lanes(image_bytes, n_lanes)
+        predicted_count = 0
         for lane in lanes_data["lanes"]:
             try:
                 pred = model_manager.predict(lane)
+                predicted_count += 1
             except ValueError:
                 pred = {"predicted_ct": None, "model_r2": None, "model_rmse": None}
             lane.update(pred)
 
         lanes_data["model_trained"] = model_manager.pipeline is not None
+        detected = sum(
+            1 for l in lanes_data["lanes"]
+            if not l.get("is_negative", True) and l.get("label") not in ("M", "NTC")
+        )
+        log.info("멀티레인 예측 완료: file=%s, 전체=%d개, 검출=%d개, 예측성공=%d개",
+                 file.filename, len(lanes_data["lanes"]), detected, predicted_count)
         return lanes_data
     except ValueError as e:
+        log.warning("멀티레인 예측 오류: file=%s, reason=%s", file.filename, e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        log.error("멀티레인 예측 오류: file=%s, error=%s", file.filename, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"예측 오류: {e}")
 
 
