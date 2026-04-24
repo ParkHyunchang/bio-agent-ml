@@ -9,6 +9,8 @@ PCR 젤 전기영동 이미지 처리 파사드.
   레인 순서: M, 10^8, 10^7, 10^6, 10^5, 10^4, 10^3, 10^2, 10^1, NTC
 """
 
+import os
+
 import cv2
 import numpy as np
 
@@ -17,6 +19,18 @@ from feature_extractor import extract_lane_features, LANE_LABELS
 from logger import get_logger
 
 log = get_logger("image_processor")
+
+# Decompression bomb 방지: 디코드 후 너비·높이·픽셀 수 상한
+MAX_IMAGE_DIM = int(os.getenv("ML_MAX_IMAGE_DIM", "8000"))
+MAX_IMAGE_PIXELS = int(os.getenv("ML_MAX_IMAGE_PIXELS", str(64_000_000)))  # ~64MP
+
+
+def _assert_image_bounds(img: np.ndarray) -> None:
+    h, w = img.shape[:2]
+    if w > MAX_IMAGE_DIM or h > MAX_IMAGE_DIM:
+        raise ValueError(f"이미지 해상도가 제한({MAX_IMAGE_DIM}px)을 초과합니다: {w}x{h}")
+    if (w * h) > MAX_IMAGE_PIXELS:
+        raise ValueError(f"이미지 픽셀 수가 제한({MAX_IMAGE_PIXELS:,}px)을 초과합니다: {w*h:,}")
 
 
 def extract_gel_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
@@ -76,6 +90,7 @@ def process_gel_image(image_bytes: bytes) -> dict:
     img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError("이미지를 읽을 수 없습니다. 지원 형식: JPEG, PNG, BMP, TIFF")
+    _assert_image_bounds(img)
 
     mean_brightness = float(np.mean(img))
     if mean_brightness > 128:

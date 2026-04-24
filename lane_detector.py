@@ -6,12 +6,17 @@ PCR 젤 이미지에서 레인 위치(중심 열)를 검출하는 모듈.
   find_lane_centers() → 열 강도 프로파일에서 레인 중심 인덱스 검출
 """
 
+import os
+
 import cv2
 import numpy as np
 
 from logger import get_logger
 
 log = get_logger("lane_detector")
+
+MAX_IMAGE_DIM = int(os.getenv("ML_MAX_IMAGE_DIM", "8000"))
+MAX_IMAGE_PIXELS = int(os.getenv("ML_MAX_IMAGE_PIXELS", str(64_000_000)))
 
 
 def detect_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
@@ -33,6 +38,10 @@ def detect_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
         raise ValueError("이미지를 읽을 수 없습니다. 지원 형식: JPEG, PNG, BMP, TIFF")
 
     h, w = img.shape
+    if w > MAX_IMAGE_DIM or h > MAX_IMAGE_DIM:
+        raise ValueError(f"이미지 해상도가 제한({MAX_IMAGE_DIM}px)을 초과합니다: {w}x{h}")
+    if (w * h) > MAX_IMAGE_PIXELS:
+        raise ValueError(f"이미지 픽셀 수가 제한({MAX_IMAGE_PIXELS:,}px)을 초과합니다: {w*h:,}")
     log.info("레인 검출 시작: 이미지=%dx%d, 목표 레인=%d개", w, h, n_lanes)
 
     # 방향 정규화: 밝은 배경 → 반전
