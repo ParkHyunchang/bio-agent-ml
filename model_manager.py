@@ -24,10 +24,6 @@ from typing import List
 
 import joblib
 import numpy as np
-
-from logger import get_logger
-
-log = get_logger("model_manager")
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -35,12 +31,47 @@ from sklearn.model_selection import LeaveOneOut, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from logger import get_logger
+
+log = get_logger("model_manager")
+
 _BASE_DIR = Path(os.getenv("ML_MODEL_DIR", str(Path(__file__).resolve().parent / "model")))
 MODEL_PATH = str(_BASE_DIR / "ct_predictor.pkl")
 META_PATH = str(_BASE_DIR / "ct_predictor_meta.json")
 _VERSIONS_DIR = _BASE_DIR / "versions"
+
+
+def _parse_max_versions() -> int:
+    """최대 보관 버전 수. 0/음수/비정수는 기본값으로 안전하게 폴백."""
+    raw = os.getenv("ML_MAX_MODEL_VERSIONS", "10")
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning("ML_MAX_MODEL_VERSIONS=%r 가 정수가 아님 → 기본값 10 사용", raw)
+        return 10
+    if n < 1:
+        log.warning("ML_MAX_MODEL_VERSIONS=%d 가 1 미만 → 1로 보정", n)
+        return 1
+    return n
+
+
+def _parse_float_env(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r 가 float가 아님 → 기본값 %s 사용", key, raw, default)
+        return default
+
+
 # 최대 보관 버전 수 (가장 오래된 것부터 자동 삭제).
-MAX_VERSIONS = int(os.getenv("ML_MAX_MODEL_VERSIONS", "10"))
+MAX_VERSIONS = _parse_max_versions()
+
+# Ct 유효 범위. predict()가 이 범위를 벗어나면 미검출로 처리.
+CT_MIN = _parse_float_env("ML_CT_MIN", 5.0)
+CT_MAX = _parse_float_env("ML_CT_MAX", 50.0)
 
 FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height"]
 
@@ -51,7 +82,8 @@ class ModelManager:
     def __init__(self):
         self.pipeline: Pipeline | None = None
         self.meta: dict = {}
-        # 학습은 독점 접근, 추론은 동시 허용. RLock으로 train 경계만 직렬화.
+        # 학습/롤백/리셋은 독점 접근, 추론은 락 없이 동시 허용
+        # (predict는 self.pipeline/self.meta를 시작 시점에 한 번만 스냅샷하여 일관성 확보).
         self._train_lock = threading.Lock()
         self._load_if_exists()
 
@@ -62,6 +94,17 @@ class ModelManager:
         훈련 데이터로 회귀 모델을 학습하고 디스크에 저장합니다.
         """
         with self._train_lock:
+            # 입력 검증: 길이 불일치는 silent misalignment를 만들고, n<2면 CV/회귀가
+            # 의미를 잃거나 sklearn에서 모호한 에러로 죽는다. 의도를 명확히 거절한다.
+            if len(features) != len(ct_values):
+                raise ValueError(
+                    f"길이 불일치: features={len(features)}, ct_values={len(ct_values)}"
+                )
+            if len(ct_values) < 2:
+                raise ValueError(
+                    f"학습에는 최소 2개 샘플이 필요합니다 (현재 {len(ct_values)})"
+                )
+
             X = self._to_matrix(features)
             y = np.array(ct_values, dtype=float)
             n = len(y)
@@ -110,6 +153,9 @@ class ModelManager:
                 "cv_r2_std": round(float(np.std(cv_r2_clean)), 4),
                 "trained_at": datetime.now(timezone.utc).isoformat(),
                 "feature_count": len(FEATURE_KEYS),
+                # 학습 시점의 피처 이름과 순서를 함께 저장한다. 차원은 같지만 순서/이름이
+                # 바뀌면 dimension check만으로는 잡히지 않는 silent schema drift가 발생.
+                "feature_keys": list(FEATURE_KEYS),
             }
 
             # 원자적 저장: 임시 파일 → rename
@@ -133,7 +179,12 @@ class ModelManager:
     @staticmethod
     def _atomic_save(pipeline: Pipeline, meta: dict) -> str:
         """joblib dump + json dump을 동일 디렉토리 임시파일에 저장 후 os.replace.
-        동시에 versions/{timestamp}/ 아래에도 스냅샷 보관. 반환값: version_id."""
+        동시에 versions/{timestamp}/ 아래에도 스냅샷 보관. 반환값: version_id.
+
+        pkl/meta 두 파일 교체는 os.replace 두 번 호출이라 사이에서 실패하면 어긋날 수
+        있다. 기존 current 파일을 .bak으로 백업하고, 두 번째 replace가 실패하면 양쪽
+        모두 백업으로 되돌려 디스크 상태의 정합성을 보장한다.
+        """
         base_dir = _BASE_DIR
 
         # mkstemp으로 fd를 받자마자 닫아 Windows에서 파일 핸들 잔류로 인한
@@ -151,6 +202,8 @@ class ModelManager:
         version_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         version_dir = _VERSIONS_DIR / version_id
         succeeded = False
+        backup_pkl: str | None = None
+        backup_meta: str | None = None
 
         try:
             joblib.dump(pipeline, tmp_pkl_path)
@@ -163,22 +216,47 @@ class ModelManager:
             shutil.copy2(tmp_pkl_path, str(version_dir / "ct_predictor.pkl"))
             shutil.copy2(tmp_meta_path, str(version_dir / "ct_predictor_meta.json"))
 
-            # current로 원자적 교체
-            os.replace(tmp_pkl_path, MODEL_PATH)
-            os.replace(tmp_meta_path, META_PATH)
+            # 기존 current 파일을 백업 (실패 시 복원용).
+            if os.path.exists(MODEL_PATH):
+                backup_pkl = MODEL_PATH + ".bak"
+                shutil.copy2(MODEL_PATH, backup_pkl)
+            if os.path.exists(META_PATH):
+                backup_meta = META_PATH + ".bak"
+                shutil.copy2(META_PATH, backup_meta)
+
+            # current로 원자적 교체 (두 단계: pkl → meta).
+            try:
+                os.replace(tmp_pkl_path, MODEL_PATH)
+                os.replace(tmp_meta_path, META_PATH)
+            except Exception:
+                # pkl만 교체된 상태일 수 있다. 양쪽을 백업으로 되돌려 정합성 회복.
+                if backup_pkl and os.path.exists(backup_pkl):
+                    try:
+                        shutil.copy2(backup_pkl, MODEL_PATH)
+                    except OSError as restore_err:
+                        log.error("MODEL_PATH 복원 실패: %s", restore_err)
+                if backup_meta and os.path.exists(backup_meta):
+                    try:
+                        shutil.copy2(backup_meta, META_PATH)
+                    except OSError as restore_err:
+                        log.error("META_PATH 복원 실패: %s", restore_err)
+                raise
+
             succeeded = True
             return version_id
         except Exception as e:
             log.error("모델 저장 중 치명적 오류 발생: %s", e, exc_info=True)
             raise
         finally:
-            # 성공 경로에서는 os.replace로 이미 사라졌고, 실패 경로에서는 잔여 정리.
-            for p in (tmp_pkl_path, tmp_meta_path):
+            # 성공 경로에서 tmp는 os.replace로 이미 소비됨. 실패 경로 + 백업은 여기서 정리.
+            for p in (tmp_pkl_path, tmp_meta_path, backup_pkl, backup_meta):
+                if not p:
+                    continue
                 try:
                     if os.path.exists(p):
                         os.remove(p)
                 except OSError as cleanup_err:
-                    log.warning("임시 파일 정리 실패 (%s): %s", p, cleanup_err)
+                    log.warning("임시/백업 파일 정리 실패 (%s): %s", p, cleanup_err)
             # 실패 시 이번 회차에 만든 스냅샷 디렉토리 정리.
             if not succeeded and version_dir.exists():
                 try:
@@ -249,8 +327,18 @@ class ModelManager:
             raise ValueError(f"버전 파일이 손상되었습니다: {version_id}")
 
         with self._train_lock:
-            # 임시 파일 → os.replace 로 원자적 교체.
-            # mkstemp + os.close로 Windows에서 파일 핸들 잔류를 방지한다.
+            # 1) 메모리에 먼저 로드해 손상 여부를 검증한다 (실패하면 디스크 변경 없음).
+            try:
+                new_pipeline = joblib.load(str(src_pkl))
+                with open(src_meta, encoding="utf-8") as f:
+                    new_meta = json.load(f)
+            except Exception as e:
+                log.error("롤백 대상 버전 로드 실패 (%s): %s", version_id, e)
+                raise
+
+            # 2) 디스크 current를 원자적으로 교체. _atomic_save와 동일한 백업-복원 패턴.
+            backup_pkl: str | None = None
+            backup_meta: str | None = None
             fd_pkl, tmp_pkl_path = tempfile.mkstemp(
                 dir=str(_BASE_DIR), prefix=".tmp_rollback_", suffix=".pkl"
             )
@@ -262,20 +350,40 @@ class ModelManager:
             try:
                 shutil.copy2(str(src_pkl), tmp_pkl_path)
                 shutil.copy2(str(src_meta), tmp_meta_path)
-                os.replace(tmp_pkl_path, MODEL_PATH)
-                os.replace(tmp_meta_path, META_PATH)
-            except Exception:
-                for p in (tmp_pkl_path, tmp_meta_path):
+                if os.path.exists(MODEL_PATH):
+                    backup_pkl = MODEL_PATH + ".bak"
+                    shutil.copy2(MODEL_PATH, backup_pkl)
+                if os.path.exists(META_PATH):
+                    backup_meta = META_PATH + ".bak"
+                    shutil.copy2(META_PATH, backup_meta)
+                try:
+                    os.replace(tmp_pkl_path, MODEL_PATH)
+                    os.replace(tmp_meta_path, META_PATH)
+                except Exception:
+                    if backup_pkl and os.path.exists(backup_pkl):
+                        try:
+                            shutil.copy2(backup_pkl, MODEL_PATH)
+                        except OSError as restore_err:
+                            log.error("MODEL_PATH 복원 실패: %s", restore_err)
+                    if backup_meta and os.path.exists(backup_meta):
+                        try:
+                            shutil.copy2(backup_meta, META_PATH)
+                        except OSError as restore_err:
+                            log.error("META_PATH 복원 실패: %s", restore_err)
+                    raise
+            finally:
+                for p in (tmp_pkl_path, tmp_meta_path, backup_pkl, backup_meta):
+                    if not p:
+                        continue
                     try:
-                        if os.path.exists(p): os.remove(p)
+                        if os.path.exists(p):
+                            os.remove(p)
                     except OSError:
                         pass
-                raise
 
-            # 메모리 reload
-            self.pipeline = joblib.load(MODEL_PATH)
-            with open(META_PATH, encoding="utf-8") as f:
-                self.meta = json.load(f)
+            # 3) 디스크 교체 성공 후 메모리 swap (1단계에서 이미 검증된 객체 재사용).
+            self.pipeline = new_pipeline
+            self.meta = new_meta
             log.info("모델 롤백 완료 → version=%s", version_id)
             return {"rolled_back_to": version_id, **self.meta}
 
@@ -296,22 +404,36 @@ class ModelManager:
             raise ValueError("학습된 모델이 없습니다. /train 을 먼저 실행하세요.")
 
         X = self._to_matrix([features])
-        # 저장된 모델의 피처 수와 다를 경우 슬라이싱 (하위 호환)
-        trained_feature_count = current_meta.get("feature_count", 5)
+        # 차원 불일치는 silent truncate 대신 명시적 실패 — 잘못된 모델/피처 정의로 인한
+        # 무의미한 예측이 클라이언트로 흘러가는 것을 차단한다.
+        trained_feature_count = current_meta.get("feature_count", len(FEATURE_KEYS))
         if X.shape[1] != trained_feature_count:
-            X = X[:, :trained_feature_count]
+            raise ValueError(
+                f"피처 차원 불일치: 입력={X.shape[1]}, 학습={trained_feature_count}. "
+                "모델 재학습이 필요합니다."
+            )
+        # 피처 이름/순서가 바뀐 모델은 차원이 같아도 의미가 완전히 다르다 (silent schema
+        # drift). 메타에 feature_keys가 있다면 정확히 일치하는지 확인한다.
+        # 구버전 모델은 feature_keys가 없을 수 있어 누락 시에는 통과시킨다 (호환성).
+        trained_keys = current_meta.get("feature_keys")
+        if trained_keys is not None and list(trained_keys) != list(FEATURE_KEYS):
+            raise ValueError(
+                f"피처 스키마 불일치: trained={list(trained_keys)}, "
+                f"current={list(FEATURE_KEYS)}. 모델 재학습이 필요합니다."
+            )
         predicted_ct = float(current_pipeline.predict(X)[0])
 
-        CT_MIN, CT_MAX = 5.0, 50.0
         if predicted_ct < CT_MIN or predicted_ct > CT_MAX:
             log.warning("Ct값 범위 이탈 (%.2f) → 미검출 처리", predicted_ct)
             raise ValueError(f"예측값({predicted_ct:.2f})이 유효 범위({CT_MIN}–{CT_MAX})를 벗어났습니다.")
 
         log.info("Ct값 예측 완료 - predicted_ct=%.2f (model=%s)", predicted_ct, current_meta.get("model_type"))
+        # 메타가 비어 있으면 0.0 대신 None을 반환 — 클라이언트가 "지표 없음"과 "지표가
+        # 0이다"를 구분할 수 있도록 한다.
         return {
             "predicted_ct": round(predicted_ct, 2),
-            "model_r2": current_meta.get("cv_r2_mean", 0.0),
-            "model_rmse": current_meta.get("train_rmse", 0.0),
+            "model_r2": current_meta.get("cv_r2_mean"),
+            "model_rmse": current_meta.get("train_rmse"),
         }
 
     def get_status(self) -> dict:
@@ -325,7 +447,7 @@ class ModelManager:
         return {"trained": True, **current_meta.copy()}
 
     def reset(self):
-        """모델과 메타 파일을 삭제하고 초기화합니다."""
+        """모델, 메타, 그리고 모든 버전 스냅샷을 삭제하고 초기화합니다."""
         with self._train_lock:
             self.pipeline = None
             self.meta = {}
@@ -335,23 +457,41 @@ class ModelManager:
                         os.remove(path)
                     except OSError as e:
                         log.warning("모델 파일 삭제 실패 (%s): %s", path, e)
+            # 버전 아카이브도 함께 정리 — reset 후 list_versions/rollback 결과가
+            # 비어 있도록 일관성을 맞춘다.
+            if _VERSIONS_DIR.exists():
+                try:
+                    shutil.rmtree(str(_VERSIONS_DIR), ignore_errors=True)
+                except OSError as e:
+                    log.warning("버전 디렉토리 삭제 실패 (%s): %s", _VERSIONS_DIR, e)
             log.info("모델 초기화 완료")
 
     # ── 내부 헬퍼 ──────────────────────────────────────────────────
 
     def _load_if_exists(self):
-        """저장된 모델과 메타 파일이 있으면 로드합니다."""
-        if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
-            try:
-                self.pipeline = joblib.load(MODEL_PATH)
-                with open(META_PATH, encoding="utf-8") as f:
-                    self.meta = json.load(f)
-                log.info("저장된 모델 로드 완료 - %s (samples=%d, R²=%.4f)",
-                         self.meta.get("model_type"), self.meta.get("sample_count", 0), self.meta.get("train_r2", 0))
-            except (IOError, OSError, json.JSONDecodeError) as e:
-                log.warning("모델 파일 읽기 실패 (무시): %s", e)
-            except Exception as e:
-                log.warning("모델 역직렬화 실패 (무시): %s", e)
+        """저장된 모델과 메타 파일이 있으면 로드합니다.
+
+        pipeline 로드는 성공했는데 meta 로드가 실패하는 경우 self.pipeline만 채워지면
+        cv_r2/version_id 등이 빠진 채 predict가 잘못된 메타를 반환한다. 둘 다 성공할
+        때만 한꺼번에 self에 반영한다 (all-or-nothing).
+        """
+        if not (os.path.exists(MODEL_PATH) and os.path.exists(META_PATH)):
+            return
+        try:
+            pipeline = joblib.load(MODEL_PATH)
+            with open(META_PATH, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (IOError, OSError, json.JSONDecodeError) as e:
+            log.warning("모델 파일 읽기 실패 (무시): %s", e)
+            return
+        except Exception as e:
+            log.warning("모델 역직렬화 실패 (무시): %s", e)
+            return
+
+        self.pipeline = pipeline
+        self.meta = meta
+        log.info("저장된 모델 로드 완료 - %s (samples=%d, R²=%.4f)",
+                 meta.get("model_type"), meta.get("sample_count", 0), meta.get("train_r2", 0))
 
     @staticmethod
     def _select_model(n: int):
