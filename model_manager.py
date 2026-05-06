@@ -15,6 +15,7 @@ scikit-learn 기반 qPCR Ct값 예측 회귀 모델 관리 모듈.
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -79,12 +80,26 @@ class ModelManager:
             cv_r2 = cross_val_score(pipeline, X, y, cv=cv, scoring="r2")
             log.info("교차 검증 완료: R² scores=%s", np.round(cv_r2, 4).tolist())
 
+            # 데이터 품질 문제(예: 모든 y가 동일)로 인해 R²가 NaN 또는 극단적 음수가
+            # 나올 수 있다. 메타에 그대로 노출되면 대시보드/클라이언트가 오해할 수 있어
+            # 하한선을 둬서 안정화하고, 비정상 분포는 워닝으로 남긴다.
+            CV_R2_FLOOR = -1.0
+            nan_count = int(np.isnan(cv_r2).sum())
+            below_floor = cv_r2[~np.isnan(cv_r2)] < CV_R2_FLOOR
+            if nan_count > 0:
+                log.warning("교차 검증 R²에 NaN %d개 포함 → 0.0으로 대체", nan_count)
+            if below_floor.any():
+                log.warning(
+                    "교차 검증 R²가 하한(%g) 미만인 fold %d개 발견 (raw=%s) → 클리핑",
+                    CV_R2_FLOOR, int(below_floor.sum()), np.round(cv_r2, 4).tolist(),
+                )
+
             # 전체 데이터로 최종 학습
             log.info("전체 데이터로 최종 모델 학습 중...")
             pipeline.fit(X, y)
             y_pred = pipeline.predict(X)
 
-            cv_r2_clean = np.nan_to_num(cv_r2, nan=0.0)
+            cv_r2_clean = np.clip(np.nan_to_num(cv_r2, nan=0.0), CV_R2_FLOOR, 1.0)
 
             new_meta = {
                 "sample_count": n,
@@ -120,18 +135,22 @@ class ModelManager:
         """joblib dump + json dump을 동일 디렉토리 임시파일에 저장 후 os.replace.
         동시에 versions/{timestamp}/ 아래에도 스냅샷 보관. 반환값: version_id."""
         base_dir = _BASE_DIR
-        with tempfile.NamedTemporaryFile(
-            dir=str(base_dir), prefix=".tmp_model_", suffix=".pkl", delete=False
-        ) as tmp_pkl:
-            tmp_pkl_path = tmp_pkl.name
-        with tempfile.NamedTemporaryFile(
-            dir=str(base_dir), prefix=".tmp_meta_", suffix=".json", delete=False,
-            mode="w", encoding="utf-8"
-        ) as tmp_meta:
-            tmp_meta_path = tmp_meta.name
+
+        # mkstemp으로 fd를 받자마자 닫아 Windows에서 파일 핸들 잔류로 인한
+        # PermissionError(공유 위반)를 방지한다. NamedTemporaryFile은 with 블록
+        # 종료 시점이 OS별로 미묘하게 다를 수 있어 명시적으로 close를 분리.
+        fd_pkl, tmp_pkl_path = tempfile.mkstemp(
+            dir=str(base_dir), prefix=".tmp_model_", suffix=".pkl"
+        )
+        os.close(fd_pkl)
+        fd_meta, tmp_meta_path = tempfile.mkstemp(
+            dir=str(base_dir), prefix=".tmp_meta_", suffix=".json"
+        )
+        os.close(fd_meta)
 
         version_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         version_dir = _VERSIONS_DIR / version_id
+        succeeded = False
 
         try:
             joblib.dump(pipeline, tmp_pkl_path)
@@ -141,29 +160,31 @@ class ModelManager:
             # 버전 아카이브 (current와 별개 복사본)
             _VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
             version_dir.mkdir(parents=True, exist_ok=True)
-            import shutil
             shutil.copy2(tmp_pkl_path, str(version_dir / "ct_predictor.pkl"))
             shutil.copy2(tmp_meta_path, str(version_dir / "ct_predictor_meta.json"))
 
             # current로 원자적 교체
             os.replace(tmp_pkl_path, MODEL_PATH)
             os.replace(tmp_meta_path, META_PATH)
+            succeeded = True
             return version_id
-        except Exception:
+        except Exception as e:
+            log.error("모델 저장 중 치명적 오류 발생: %s", e, exc_info=True)
+            raise
+        finally:
+            # 성공 경로에서는 os.replace로 이미 사라졌고, 실패 경로에서는 잔여 정리.
             for p in (tmp_pkl_path, tmp_meta_path):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
-                except OSError:
-                    pass
-            # 실패 시 스냅샷 정리
-            try:
-                if version_dir.exists():
-                    import shutil
+                except OSError as cleanup_err:
+                    log.warning("임시 파일 정리 실패 (%s): %s", p, cleanup_err)
+            # 실패 시 이번 회차에 만든 스냅샷 디렉토리 정리.
+            if not succeeded and version_dir.exists():
+                try:
                     shutil.rmtree(str(version_dir), ignore_errors=True)
-            except OSError:
-                pass
-            raise
+                except OSError as cleanup_err:
+                    log.warning("스냅샷 디렉토리 정리 실패 (%s): %s", version_dir, cleanup_err)
 
     @staticmethod
     def _prune_old_versions():
@@ -177,7 +198,6 @@ class ModelManager:
         excess = len(versions) - MAX_VERSIONS
         if excess <= 0:
             return
-        import shutil
         for old in versions[:excess]:
             try:
                 shutil.rmtree(str(old), ignore_errors=True)
@@ -229,16 +249,16 @@ class ModelManager:
             raise ValueError(f"버전 파일이 손상되었습니다: {version_id}")
 
         with self._train_lock:
-            # 임시 파일 → os.replace 로 원자적 교체
-            import shutil
-            with tempfile.NamedTemporaryFile(
-                dir=str(_BASE_DIR), prefix=".tmp_rollback_", suffix=".pkl", delete=False
-            ) as tmp_pkl:
-                tmp_pkl_path = tmp_pkl.name
-            with tempfile.NamedTemporaryFile(
-                dir=str(_BASE_DIR), prefix=".tmp_rollback_", suffix=".json", delete=False
-            ) as tmp_meta:
-                tmp_meta_path = tmp_meta.name
+            # 임시 파일 → os.replace 로 원자적 교체.
+            # mkstemp + os.close로 Windows에서 파일 핸들 잔류를 방지한다.
+            fd_pkl, tmp_pkl_path = tempfile.mkstemp(
+                dir=str(_BASE_DIR), prefix=".tmp_rollback_", suffix=".pkl"
+            )
+            os.close(fd_pkl)
+            fd_meta, tmp_meta_path = tempfile.mkstemp(
+                dir=str(_BASE_DIR), prefix=".tmp_rollback_", suffix=".json"
+            )
+            os.close(fd_meta)
             try:
                 shutil.copy2(str(src_pkl), tmp_pkl_path)
                 shutil.copy2(str(src_meta), tmp_meta_path)
@@ -266,33 +286,43 @@ class ModelManager:
         Returns:
             dict: predicted_ct, model_r2, model_rmse
         """
-        if self.pipeline is None:
+        # train과 predict가 동시에 일어나는 경우 pipeline/meta가 부분적으로 교체된
+        # 상태에서 읽으면 피처 차원 불일치가 발생할 수 있다. 시작 시점에 한 번만
+        # 스냅샷을 떠서 일관된 한 쌍으로 사용한다.
+        current_pipeline = self.pipeline
+        current_meta = self.meta
+
+        if current_pipeline is None:
             raise ValueError("학습된 모델이 없습니다. /train 을 먼저 실행하세요.")
 
         X = self._to_matrix([features])
         # 저장된 모델의 피처 수와 다를 경우 슬라이싱 (하위 호환)
-        trained_feature_count = self.meta.get("feature_count", 5)
+        trained_feature_count = current_meta.get("feature_count", 5)
         if X.shape[1] != trained_feature_count:
             X = X[:, :trained_feature_count]
-        predicted_ct = float(self.pipeline.predict(X)[0])
+        predicted_ct = float(current_pipeline.predict(X)[0])
 
         CT_MIN, CT_MAX = 5.0, 50.0
         if predicted_ct < CT_MIN or predicted_ct > CT_MAX:
             log.warning("Ct값 범위 이탈 (%.2f) → 미검출 처리", predicted_ct)
             raise ValueError(f"예측값({predicted_ct:.2f})이 유효 범위({CT_MIN}–{CT_MAX})를 벗어났습니다.")
 
-        log.info("Ct값 예측 완료 - predicted_ct=%.2f (model=%s)", predicted_ct, self.meta.get("model_type"))
+        log.info("Ct값 예측 완료 - predicted_ct=%.2f (model=%s)", predicted_ct, current_meta.get("model_type"))
         return {
             "predicted_ct": round(predicted_ct, 2),
-            "model_r2": self.meta.get("cv_r2_mean", 0.0),
-            "model_rmse": self.meta.get("train_rmse", 0.0),
+            "model_r2": current_meta.get("cv_r2_mean", 0.0),
+            "model_rmse": current_meta.get("train_rmse", 0.0),
         }
 
     def get_status(self) -> dict:
         """현재 모델 상태를 반환합니다."""
-        if self.pipeline is None:
+        # predict와 동일한 이유로 한 번에 스냅샷. 또한 호출자가 반환된 dict를 변형해도
+        # self.meta가 오염되지 않도록 shallow copy로 분리한다.
+        current_pipeline = self.pipeline
+        current_meta = self.meta
+        if current_pipeline is None:
             return {"trained": False, "message": "학습된 모델 없음"}
-        return {"trained": True, **self.meta}
+        return {"trained": True, **current_meta.copy()}
 
     def reset(self):
         """모델과 메타 파일을 삭제하고 초기화합니다."""
@@ -333,7 +363,20 @@ class ModelManager:
 
     @staticmethod
     def _to_matrix(features: List[dict]) -> np.ndarray:
-        return np.array(
-            [[f.get(k, 0.0) for k in FEATURE_KEYS] for f in features],
-            dtype=float,
-        )
+        # 피처는 모두 물리적 치수/밝기이므로 0.0 fallback은 위험 (왜곡된 예측 유발).
+        # 누락/타입 불일치는 침묵하지 말고 명시적으로 실패시킨다.
+        matrix = []
+        for idx, f in enumerate(features):
+            row = []
+            for k in FEATURE_KEYS:
+                val = f.get(k)
+                if val is None:
+                    raise ValueError(f"샘플 index {idx}에서 필수 특징 '{k}'이(가) 누락되었습니다.")
+                try:
+                    row.append(float(val))
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"샘플 index {idx}의 '{k}' 값({val!r})을 float로 변환할 수 없습니다."
+                    )
+            matrix.append(row)
+        return np.array(matrix, dtype=float)
