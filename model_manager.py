@@ -6,8 +6,11 @@ scikit-learn 기반 qPCR Ct값 예측 회귀 모델 관리 모듈.
   10~29개 → GradientBoostingRegressor (비선형, 중소 데이터)
   30개 이상 → RandomForestRegressor (앙상블, 충분한 데이터)
 
-특징 벡터 (4차원):
-  [band_intensity, band_area, relative_intensity, band_width]
+특징 벡터 (5차원, 이미지에서 추출한 밴드 특징만):
+  [band_intensity, band_area, relative_intensity, band_width, band_height]
+
+주의: log10_concentration은 레인 라벨에서 파생된 정답성 정보이므로
+모델 입력으로 사용하지 않습니다 (data leakage 방지).
 """
 
 import json
@@ -38,7 +41,7 @@ _VERSIONS_DIR = _BASE_DIR / "versions"
 # 최대 보관 버전 수 (가장 오래된 것부터 자동 삭제).
 MAX_VERSIONS = int(os.getenv("ML_MAX_MODEL_VERSIONS", "10"))
 
-FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height", "log10_concentration"]
+FEATURE_KEYS = ["band_intensity", "band_area", "relative_intensity", "band_width", "band_height"]
 
 
 class ModelManager:
@@ -268,7 +271,7 @@ class ModelManager:
 
         X = self._to_matrix([features])
         # 저장된 모델의 피처 수와 다를 경우 슬라이싱 (하위 호환)
-        trained_feature_count = self.meta.get("feature_count", 4)
+        trained_feature_count = self.meta.get("feature_count", 5)
         if X.shape[1] != trained_feature_count:
             X = X[:, :trained_feature_count]
         predicted_ct = float(self.pipeline.predict(X)[0])
