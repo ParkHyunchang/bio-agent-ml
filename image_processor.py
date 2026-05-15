@@ -64,7 +64,9 @@ def extract_gel_lanes(image_bytes: bytes, n_lanes: int = 10) -> dict:
 
     saturated = sum(1 for l in lanes if l.get("is_saturated"))
     negative  = sum(1 for l in lanes if l.get("is_negative"))
-    log.info("멀티레인 추출 완료: %d개 레인 (포화=%d, 미검출=%d)", len(lanes), saturated, negative)
+    faint     = sum(1 for l in lanes if l.get("is_faint"))
+    log.info("멀티레인 추출 완료: %d개 레인 (포화=%d, 미검출=%d, 희미=%d)",
+             len(lanes), saturated, negative, faint)
     return {
         "lanes": lanes,
         "n_lanes_detected": len(lanes),

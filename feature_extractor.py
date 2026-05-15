@@ -18,6 +18,10 @@ LOG10_CONC = {
     "10^4": 4, "10^3": 3, "10^2": 2, "10^1": 1,
 }
 
+# Faint band: 검출은 됐지만 global_max 대비 약한 밴드.
+# is_negative(< 1%) 위, 정상 밴드(>= 10%) 아래 구간 → 1% ≤ relative_intensity < 10%.
+FAINT_INTENSITY_RATIO = 0.10
+
 
 def extract_lane_features(lane_img: np.ndarray, label: str,
                            lane_index: int, global_max: float) -> dict:
@@ -44,7 +48,8 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
     if h == 0 or w == 0:
         return {**base, "band_intensity": 0.0, "band_area": 0.0,
                 "relative_intensity": 0.0, "band_width": 0.0, "band_height": 0.0,
-                "is_saturated": False, "is_negative": True, "is_primer_dimer": False}
+                "is_saturated": False, "is_negative": True,
+                "is_faint": False, "is_primer_dimer": False}
 
     row_profile = np.mean(lane_img, axis=1)
     band_row = int(np.argmax(row_profile))
@@ -58,7 +63,8 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
     if is_negative:
         return {**base, "band_intensity": 0.0, "band_area": 0.0,
                 "relative_intensity": 0.0, "band_width": 0.0, "band_height": 0.0,
-                "is_saturated": False, "is_negative": True, "is_primer_dimer": False}
+                "is_saturated": False, "is_negative": True,
+                "is_faint": False, "is_primer_dimer": False}
 
     # 밴드 행 ±15% 범위에서 컨투어 탐색
     half_band = max(5, int(h * 0.15))
@@ -86,6 +92,9 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
 
     relative_intensity = band_intensity / global_max if global_max > 0 else 0.0
 
+    # Faint: 노이즈(< 1%)는 넘었지만 정상 밴드(>= 10%)에 못 미치는 구간. 포화된 밴드는 제외.
+    is_faint = (not is_saturated) and (relative_intensity < FAINT_INTENSITY_RATIO)
+
     # 프라이머 다이머: 젤 하단 35% + 높이가 ROI의 8% 미만인 얇은 밴드
     band_position_ratio = band_row / max(h, 1)
     is_primer_dimer = (
@@ -94,8 +103,9 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
         and not is_saturated
     )
 
-    log.debug("레인 %d (%s): intensity=%.1f area=%.0f sat=%s neg=%s",
-              lane_index, label, band_intensity, band_area, is_saturated, False)
+    log.debug("레인 %d (%s): intensity=%.1f area=%.0f rel=%.3f sat=%s faint=%s",
+              lane_index, label, band_intensity, band_area,
+              relative_intensity, is_saturated, is_faint)
 
     return {
         **base,
@@ -106,5 +116,6 @@ def extract_lane_features(lane_img: np.ndarray, label: str,
         "band_height": float(bh),
         "is_saturated": bool(is_saturated),
         "is_negative": False,
+        "is_faint": bool(is_faint),
         "is_primer_dimer": bool(is_primer_dimer),
     }
